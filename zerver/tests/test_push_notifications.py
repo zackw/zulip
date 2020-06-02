@@ -24,12 +24,14 @@ from zerver.lib.actions import (
     do_delete_messages,
     do_mark_stream_messages_as_read,
     do_regenerate_api_key,
+    do_update_message_flags,
 )
 from zerver.lib.push_notifications import (
     DeviceToken,
     absolute_avatar_url,
     b64_to_hex,
     datetime_to_timestamp,
+    get_apns_badge_count,
     get_apns_client,
     get_display_recipient,
     get_message_payload_apns,
@@ -923,13 +925,23 @@ class HandlePushNotificationTest(PushNotificationTest):
 
         with self.settings(PUSH_NOTIFICATION_BOUNCER_URL=True), \
                 mock.patch('zerver.lib.push_notifications'
-                           '.send_notifications_to_bouncer') as mock_send_android, \
+                           '.send_notifications_to_bouncer') as mock_send, \
                 mock.patch('zerver.lib.push_notifications.get_base_payload',
                            return_value={'gcm': True}):
             handle_remove_push_notification(user_profile.id, [message.id])
-            mock_send_android.assert_called_with(
+            mock_send.assert_called_with(
                 user_profile.id,
-                {},
+                {
+                    'badge': 0,
+                    'custom': {
+                        'zulip': {
+                            'gcm': True,
+                            'event': 'remove',
+                            'zulip_message_ids': str(message.id),
+                            'zulip_message_id': message.id,
+                        },
+                    },
+                },
                 {
                     'gcm': True,
                     'event': 'remove',
@@ -955,8 +967,14 @@ class HandlePushNotificationTest(PushNotificationTest):
             PushDeviceToken.objects.filter(user=self.user_profile,
                                            kind=PushDeviceToken.GCM))
 
+        apple_devices = list(
+            PushDeviceToken.objects.filter(user=self.user_profile,
+                                           kind=PushDeviceToken.APNS))
+
         with mock.patch('zerver.lib.push_notifications'
                         '.send_android_push_notification') as mock_send_android, \
+                mock.patch('zerver.lib.push_notifications'
+                           '.send_apple_push_notification') as mock_send_apple, \
                 mock.patch('zerver.lib.push_notifications.get_base_payload',
                            return_value={'gcm': True}):
             handle_remove_push_notification(self.user_profile.id, [message.id])
@@ -969,6 +987,18 @@ class HandlePushNotificationTest(PushNotificationTest):
                     'zulip_message_id': message.id,
                 },
                 {'priority': 'normal'})
+            mock_send_apple.assert_called_with(
+                self.user_profile.id,
+                apple_devices,
+                {'badge': 0,
+                 'custom': {
+                     'zulip': {
+                         'gcm': True,
+                         'event': 'remove',
+                         'zulip_message_ids': str(message.id),
+                         'zulip_message_id': message.id
+                     }
+                 }})
             user_message = UserMessage.objects.get(user_profile=self.user_profile,
                                                    message=message)
             self.assertEqual(user_message.flags.active_mobile_push_notification, False)
@@ -1150,11 +1180,40 @@ class TestAPNs(PushNotificationTest):
         self.assertEqual(
             modernize_apns_payload(
                 {'alert': 'Message from Hamlet',
-                 'message_ids': [3]}),
+                 'message_ids': [3],
+                 'badge': 0}),
             payload)
         self.assertEqual(
             modernize_apns_payload(payload),
             payload)
+
+    @mock.patch('zerver.lib.push_notifications.push_notifications_enabled', return_value = True)
+    def test_apns_badge_count(self, mock_push_notifications: mock.MagicMock) -> None:
+        user_profile = self.example_user('othello')
+        # Test APNs badge count for personal messages.
+        message_ids = [self.send_personal_message(self.sender,
+                                                  user_profile,
+                                                  'Content of message')
+                       for i in range(5)]
+        self.assertEqual(get_apns_badge_count(user_profile), 5)
+        num_messages = len(message_ids)
+        # Mark the messages as read and test whether
+        # the count decreases correctly.
+        for i, message_id in enumerate(message_ids):
+            do_update_message_flags(user_profile, get_client("website"), 'add', 'read', [message_id])
+            self.assertEqual(get_apns_badge_count(user_profile), num_messages - i - 1)
+
+        # Similarly, test APNs badge count for stream mention.
+        stream = self.subscribe(user_profile, "Denmark")
+        message_ids = [self.send_stream_message(self.sender,
+                                                stream.name,
+                                                'Hi, @**Othello, the Moor of Venice**')
+                       for i in range(5)]
+        self.assertEqual(get_apns_badge_count(user_profile), 5)
+        for i, message_id in enumerate(message_ids):
+            do_update_message_flags(user_profile, get_client("website"), 'add', 'read', [message_id])
+            self.assertEqual(get_apns_badge_count(user_profile), num_messages - i - 1)
+        mock_push_notifications.assert_called()
 
 class TestGetAPNsPayload(PushNotificationTest):
     def test_get_message_payload_apns_personal_message(self) -> None:
@@ -1206,7 +1265,7 @@ class TestGetAPNsPayload(PushNotificationTest):
                 'body': message.content,
             },
             'sound': 'default',
-            'badge': 0,
+            'badge': 1,
             'custom': {
                 'zulip': {
                     'message_ids': [message.id],
